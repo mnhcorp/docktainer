@@ -1,0 +1,808 @@
+#!/usr/bin/env python3
+
+import argparse
+import subprocess
+import sys
+import os
+import shutil
+import re # For Dockerfile parsing
+import datetime
+import hashlib
+import json # For safer parsing of CMD/ENTRYPOINT arrays and instance tracking
+import fcntl # For file locking
+import time # For retry logic in locking
+import getpass # To get current username
+import uuid # For generating unique instance names
+
+# Docktainer - A Docker-like wrapper for Apptainer
+# Version 1.6 (Fix instance name key in `is_apptainer_instance_running_on_system`)
+
+DOCKTAINER_HOME = os.path.expanduser("~/.docktainer")
+DOCKTAINER_SIF_DIR = os.path.join(DOCKTAINER_HOME, "images")
+DOCKTAINER_INSTANCES_FILE = os.path.join(DOCKTAINER_HOME, "instances.json") # Tracks managed instances
+VERBOSE_MODE = False 
+
+def ensure_docktainer_dirs():
+    os.makedirs(DOCKTAINER_HOME, exist_ok=True)
+    os.makedirs(DOCKTAINER_SIF_DIR, exist_ok=True)
+
+def echo_info(message):
+    if VERBOSE_MODE: print(f"[docktainer INFO] {message}")
+def echo_output(message): print(message)
+def echo_error(message): print(f"[docktainer ERROR] {message}", file=sys.stderr)
+
+# --- Instance State Management ---
+def load_instances():
+    if not os.path.exists(DOCKTAINER_INSTANCES_FILE): return {}
+    try:
+        with open(DOCKTAINER_INSTANCES_FILE, 'r') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try: data = json.load(f)
+            except json.JSONDecodeError: echo_info("Instances file empty or corrupt. Starting fresh."); data = {}
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            return data
+    except IOError as e: echo_error(f"Could not read instances file ({DOCKTAINER_INSTANCES_FILE}): {e}"); return {}
+
+def save_instances(instances):
+    ensure_docktainer_dirs()
+    try:
+        with open(DOCKTAINER_INSTANCES_FILE, 'w') as f:
+            max_retries = 5; retry_delay = 0.1
+            for i in range(max_retries):
+                try: fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB); break
+                except BlockingIOError: echo_info(f"Instances file locked, retrying ({i+1}/{max_retries})..."); time.sleep(retry_delay)
+            else: echo_error("Could not lock instances file. Save aborted."); return False
+            json.dump(instances, f, indent=4); fcntl.flock(f.fileno(), fcntl.LOCK_UN); return True
+    except IOError as e: echo_error(f"Could not write instances file: {e}"); return False
+
+def add_managed_instance(instance_identifier, 
+                         image_ref_for_apptainer, display_image_name, 
+                         command_str, start_time_iso, user, 
+                         is_apptainer_instance=False, original_gpus_arg=None, name_arg=None):
+    instances = load_instances()
+    instances[str(instance_identifier)] = {
+        "is_apptainer_instance": is_apptainer_instance, 
+        "image_display": display_image_name,
+        "image_ref_apptainer": image_ref_for_apptainer,
+        "command_at_start": command_str,
+        "created_iso": start_time_iso,
+        "user": user,
+        "gpus_requested": original_gpus_arg,
+        "name_arg": name_arg 
+    }
+    if save_instances(instances): echo_info(f"Registered instance: {instance_identifier}")
+    else: echo_error(f"Failed to register instance {instance_identifier}")
+
+def remove_managed_instance(identifier_str): 
+    instances = load_instances()
+    if identifier_str in instances:
+        del instances[identifier_str]
+        if save_instances(instances): echo_info(f"De-registered instance: {identifier_str}")
+        else: echo_error(f"Failed to save after de-registering {identifier_str}")
+
+def get_managed_instance_details(name_or_id_str):
+    instances = load_instances()
+    return instances.get(name_or_id_str), name_or_id_str if name_or_id_str in instances else None
+
+
+def is_apptainer_instance_running_on_system(instance_name_to_check):
+    """
+    Checks if an Apptainer instance with the given name is running using 'apptainer instance list --json'.
+    Returns (True, pid) if running, (False, None) otherwise.
+    """
+    cmd = ["apptainer", "instance", "list", "--json"]
+    result = run_command(cmd, capture_output=True, check=False, use_popen_for_capture=True) 
+    
+    if VERBOSE_MODE and result:
+        echo_info(f"  'apptainer instance list --json' STDOUT:\n{result.stdout}")
+        if result.stderr:
+            echo_info(f"  'apptainer instance list --json' STDERR:\n{result.stderr}")
+        echo_info(f"  'apptainer instance list --json' RC: {result.returncode}")
+
+    if result and result.returncode == 0 and result.stdout:
+        try:
+            instance_list_data = json.loads(result.stdout)
+            if not isinstance(instance_list_data, dict) or "instances" not in instance_list_data:
+                echo_info("  'apptainer instance list --json' output is not in expected format (missing 'instances' key or not a dict).")
+                return False, None
+
+            for inst in instance_list_data.get("instances", []):
+                # ***** KEY CHANGE HERE: Use 'instance' key for the name *****
+                current_instance_name_from_apptainer = inst.get("instance") 
+                if current_instance_name_from_apptainer == instance_name_to_check: 
+                    # Check common indicators of a running state. Apptainer versions might vary.
+                    # The 'pid' > 0 and `is_pid_running_on_system` is a good fallback.
+                    pid = inst.get("pid")
+                    if pid and pid > 0 and is_pid_running_on_system(pid):
+                        echo_info(f"  Instance '{instance_name_to_check}' found running with PID {pid}.")
+                        return True, pid
+                    # Check other state indicators if PID check isn't definitive or PID is missing
+                    if inst.get("state", "").lower() == "running" or inst.get("alive", False):
+                        echo_info(f"  Instance '{instance_name_to_check}' found with state/alive true, PID {pid}.")
+                        return True, pid # Return PID if available, even if it was 0
+            
+            echo_info(f"  Instance '{instance_name_to_check}' not found in 'apptainer instance list' output or not in a confirmed running state.")
+            return False, None 
+        except json.JSONDecodeError:
+            echo_error("Could not parse 'apptainer instance list' JSON output.")
+            return False, None
+    elif result and result.returncode != 0: 
+        if result.stderr and "no instances found" in result.stderr.lower():
+             echo_info(f"  'apptainer instance list' reported no instances running.")
+        elif result.stderr: 
+             echo_info(f"  'apptainer instance list' command failed or returned non-zero. Stderr: {result.stderr.strip()}")
+        else:
+             echo_info(f"  'apptainer instance list' command returned non-zero (RC: {result.returncode}) with no specific error message.")
+    elif not result: 
+        echo_error("  Execution of 'apptainer instance list' failed.")
+        
+    return False, None
+
+def is_pid_running_on_system(pid):
+    if not isinstance(pid, int) or pid <= 0: return False
+    try: os.kill(pid, 0)  
+    except OSError: return False  
+    else: return True   
+
+# --- Command Execution Helper ---
+def run_command(command_list, check=True, capture_output=False, shell=False, 
+                use_popen=False, 
+                detach_as_apptainer_instance=False, 
+                instance_name=None, image_sif_for_instance=None, apptainer_run_options=None, 
+                cwd=None, use_popen_for_capture=False): 
+    
+    command_list_str = [str(item) for item in command_list]
+    command_to_run_display = ' '.join(command_list_str)
+    command_to_run_exec = command_list_str
+    if shell: command_to_run_exec = ' '.join(command_list_str)
+
+    echo_info(f"Executing: {command_to_run_display} (in CWD: {cwd or os.getcwd()})")
+    
+    try:
+        if detach_as_apptainer_instance:
+            instance_start_cmd = ["apptainer", "instance", "start"]
+            if apptainer_run_options: instance_start_cmd.extend(apptainer_run_options)
+            instance_start_cmd.extend([image_sif_for_instance, instance_name])
+            
+            echo_info(f"Starting Apptainer instance: {' '.join(instance_start_cmd)}")
+            result = subprocess.run(instance_start_cmd, capture_output=True, text=True, check=False, cwd=cwd)
+            
+            if result.returncode == 0:
+                echo_info(f"Apptainer instance '{instance_name}' start command reported success.")
+                return {"instance_name": instance_name, "status": "start_cmd_ok", "pid": None, "raw_result": result} 
+            else:
+                echo_error(f"Failed to start Apptainer instance '{instance_name}'. RC: {result.returncode}")
+                if result.stdout: echo_error(f"Stdout: {result.stdout.strip()}")
+                if result.stderr: echo_error(f"Stderr: {result.stderr.strip()}")
+                return None
+
+        elif use_popen or use_popen_for_capture: 
+            process = subprocess.Popen(command_to_run_exec, 
+                                     stdout=subprocess.PIPE if use_popen_for_capture else None, 
+                                     stderr=subprocess.PIPE if use_popen_for_capture else None, 
+                                     text=True if use_popen_for_capture else False, 
+                                     shell=shell, cwd=cwd)
+            if use_popen_for_capture: 
+                stdout, stderr = process.communicate()
+                return subprocess.CompletedProcess(process.args, process.returncode, stdout=stdout, stderr=stderr)
+            else: 
+                echo_info(f"Foreground/Popen process started with PID: {process.pid}")
+                return process 
+        
+        if capture_output:
+            result = subprocess.run(command_to_run_exec, check=check, capture_output=True, text=True, shell=shell, cwd=cwd)
+            return result
+        else:
+            result = subprocess.run(command_to_run_exec, check=check, shell=shell, cwd=cwd)
+            return result
+            
+    except subprocess.CalledProcessError as e:
+        echo_error(f"Command failed: {e}")
+        if hasattr(e, 'stdout') and e.stdout: echo_error(f"Stdout: {e.stdout.strip()}")
+        if hasattr(e, 'stderr') and e.stderr: echo_error(f"Stderr: {e.stderr.strip()}")
+        return None
+    except FileNotFoundError:
+        cmd_name = command_to_run_exec if isinstance(command_to_run_exec, str) else command_to_run_exec[0]
+        if isinstance(command_to_run_exec, str): cmd_name = command_to_run_exec.split()[0]
+        echo_error(f"Command not found: {cmd_name}. Is it installed and in your PATH?")
+        return None
+    except Exception as e:
+        echo_error(f"An unexpected error occurred ({type(e).__name__}) while running command: {e}")
+        return None
+
+def get_sif_path(image_name_or_sif_file):
+    if os.path.isfile(image_name_or_sif_file) and image_name_or_sif_file.endswith(".sif"):
+        return os.path.abspath(image_name_or_sif_file)
+    potential_sif_name = image_name_or_sif_file.replace(":", "_").replace("/", "_") + ".sif"
+    path = os.path.join(DOCKTAINER_SIF_DIR, potential_sif_name)
+    return path if os.path.exists(path) else None
+
+# --- Command Handlers ---
+def handle_pull(args):
+    ensure_docktainer_dirs()
+    echo_info(f"Pulling image: {args.image_name}")
+    sif_filename_base = args.image_name.replace(":", "_").replace("/", "_")
+    output_sif_name = f"{sif_filename_base}.sif"
+    output_sif_path = os.path.join(DOCKTAINER_SIF_DIR, output_sif_name)
+
+    if os.path.exists(output_sif_path) and not args.force:
+        echo_output(f"Image '{args.image_name}' ({output_sif_name}) already exists locally. Use --force to re-pull.")
+        return
+    if args.force and os.path.exists(output_sif_path):
+        echo_info(f"Force pulling. Removing existing SIF: {output_sif_path}")
+        try: os.remove(output_sif_path)
+        except OSError as e: echo_error(f"Could not remove existing SIF for force pull: {e}"); return
+
+    apptainer_cmd = ["apptainer", "pull"]
+    if args.force: apptainer_cmd.append("--force")
+    apptainer_cmd.extend([output_sif_path, f"docker://{args.image_name}"])
+    
+    result = run_command(apptainer_cmd)
+    if result and result.returncode == 0:
+        echo_output(f"Status: Downloaded image for {args.image_name}")
+        echo_info(f"Successfully pulled and saved image as {output_sif_path}")
+    else: echo_error(f"Failed to pull {args.image_name}.")
+
+def handle_run(args):
+    ensure_docktainer_dirs()
+    echo_info(f"Attempting to run image: {args.image_name}")
+    command_str_for_ps = " ".join(args.command_and_args) if args.command_and_args else "<default_runscript>"
+
+    apptainer_run_options = [] 
+    sif_path = get_sif_path(args.image_name)
+    image_ref_for_apptainer_command = "" 
+    display_image_name_for_ps = args.image_name 
+
+    if sif_path:
+        echo_info(f"  Using local SIF image: {sif_path}")
+        image_ref_for_apptainer_command = sif_path
+        display_image_name_for_ps = os.path.basename(sif_path)
+    elif "://" in args.image_name: 
+        image_ref_for_apptainer_command = args.image_name
+        echo_info(f"  Using direct URI: {image_ref_for_apptainer_command}")
+    else: 
+        image_ref_for_apptainer_command = f"docker://{args.image_name}"
+        echo_info(f"  Using docker URI: {image_ref_for_apptainer_command}")
+
+    if args.it: echo_info("  Interactive TTY (-it) requested.")
+    if args.volume:
+        for vol_map in args.volume: apptainer_run_options.extend(["--bind", vol_map])
+    if args.env:
+        for env_var in args.env: apptainer_run_options.extend(["--env", env_var]) 
+    if args.workdir: apptainer_run_options.extend(["--cwd", args.workdir])
+    
+    original_gpus_arg_for_storage = None
+    if args.gpus:
+        echo_info(f"  GPU specification: --gpus {args.gpus}")
+        apptainer_run_options.append("--nv") 
+        original_gpus_arg_for_storage = args.gpus
+        if args.gpus.lower() != "all":
+            apptainer_run_options.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={args.gpus}"])
+            echo_info(f"    Setting NVIDIA_VISIBLE_DEVICES={args.gpus} for instance environment.")
+        else:
+            echo_info("    --nv flag enabled for all GPUs for instance.")
+
+    start_time_iso = datetime.datetime.now().isoformat()
+    current_user = getpass.getuser()
+
+    if args.detach:
+        local_sif_for_instance = sif_path
+        if not local_sif_for_instance: 
+            echo_info(f"  Image '{args.image_name}' for detached run is not a local SIF. Attempting to pull.")
+            pull_args = argparse.Namespace(image_name=args.image_name, force=False) 
+            handle_pull(pull_args) 
+            local_sif_for_instance = get_sif_path(args.image_name)
+            if not local_sif_for_instance:
+                echo_error(f"Could not resolve or pull SIF for '{args.image_name}' for detached run. Aborting.")
+                return
+            display_image_name_for_ps = os.path.basename(local_sif_for_instance) 
+            echo_info(f"  Using resolved SIF for instance: {local_sif_for_instance}")
+        
+        instance_name = args.name if args.name else f"docktainer-inst-{uuid.uuid4().hex[:8]}"
+        echo_info(f"  Attempting to start Apptainer instance: {instance_name}")
+
+        is_already_running_system, _ = is_apptainer_instance_running_on_system(instance_name)
+        if is_already_running_system:
+            echo_error(f"Apptainer instance '{instance_name}' is already running on the system.")
+            managed_details, _ = get_managed_instance_details(instance_name)
+            if not managed_details:
+                echo_info(f"Instance '{instance_name}' is running but not managed by Docktainer state. You may need to stop it manually with 'apptainer instance stop {instance_name}'.")
+            return
+
+        managed_details, _ = get_managed_instance_details(instance_name)
+        if managed_details and not is_already_running_system: 
+            echo_info(f"Found stale Docktainer state for '{instance_name}'. Removing before starting new instance.")
+            remove_managed_instance(instance_name)
+            
+        if args.command_and_args:
+            echo_info(f"  Note: Command '{' '.join(args.command_and_args)}' provided with -d is for display in 'ps'. The SIF's default runscript/startscript will be used by 'apptainer instance start'.")
+
+        instance_result_dict = run_command(
+            [], 
+            detach_as_apptainer_instance=True,
+            instance_name=instance_name,
+            image_sif_for_instance=local_sif_for_instance, 
+            apptainer_run_options=apptainer_run_options,
+            cwd=args.workdir
+        )
+
+        if instance_result_dict and instance_result_dict.get("status") == "start_cmd_ok":
+            confirmed_running = False
+            confirmed_pid = None
+            max_confirm_retries = 7 # Increased retries
+            confirm_delay = 0.3 # Slightly shorter initial delay
+            for i in range(max_confirm_retries):
+                echo_info(f"  Confirming instance '{instance_name}' status (attempt {i+1}/{max_confirm_retries})...")
+                if i > 0 : time.sleep(confirm_delay * i) # Start delay from second attempt
+                
+                running_check, pid_check = is_apptainer_instance_running_on_system(instance_name)
+                if running_check and pid_check:
+                    confirmed_running = True
+                    confirmed_pid = pid_check
+                    echo_info(f"  Instance '{instance_name}' confirmed running with PID {confirmed_pid}.")
+                    break
+                elif i < max_confirm_retries -1:
+                    echo_info(f"  Instance '{instance_name}' not yet confirmed in list. Retrying...")
+            
+            if confirmed_running:
+                add_managed_instance(instance_name, local_sif_for_instance, display_image_name_for_ps, 
+                                     command_str_for_ps, start_time_iso, current_user, 
+                                     is_apptainer_instance=True, original_gpus_arg=original_gpus_arg_for_storage, name_arg=args.name)
+            else:
+                echo_error(f"Instance '{instance_name}' start command succeeded but could not confirm running status via 'instance list' after retries.")
+                raw_apptainer_result = instance_result_dict.get("raw_result")
+                if raw_apptainer_result and raw_apptainer_result.stderr:
+                     echo_error(f"  Apptainer start stderr was: {raw_apptainer_result.stderr.strip()}")
+                echo_info(f"Attempting to stop potentially orphaned instance '{instance_name}'...")
+                run_command(["apptainer", "instance", "stop", instance_name], check=False) 
+        else:
+            echo_error(f"Failed to start Apptainer instance '{instance_name}' (initial start command failed).")
+
+    else: 
+        apptainer_base_cmd_type = ""
+        if args.it and (not args.command_and_args or (args.command_and_args and args.command_and_args[0] in ["/bin/bash", "/bin/sh", "bash", "sh"])) :
+            apptainer_base_cmd_type = "shell"
+            if args.command_and_args and args.command_and_args[0] not in ["/bin/bash", "/bin/sh", "bash", "sh"]:
+                apptainer_base_cmd_type = "exec"
+            if not args.command_and_args : command_str_for_ps = "/bin/sh" 
+        elif args.command_and_args:
+            apptainer_base_cmd_type = "exec"
+        else:
+            apptainer_base_cmd_type = "run"
+            command_str_for_ps = "<runscript>"
+        
+        apptainer_base_cmd = ["apptainer", apptainer_base_cmd_type]
+        full_apptainer_cmd = apptainer_base_cmd + apptainer_run_options + [image_ref_for_apptainer_command]
+
+        if apptainer_base_cmd_type == "exec" and args.command_and_args:
+            full_apptainer_cmd.extend(args.command_and_args)
+        elif apptainer_base_cmd_type == "shell" and args.command_and_args and args.command_and_args[0] not in ["/bin/bash", "/bin/sh", "bash", "sh"]:
+            if full_apptainer_cmd[1] == "shell": full_apptainer_cmd[1] = "exec" 
+            current_cmd_start_index = len(apptainer_base_cmd) + len(apptainer_run_options) + 1
+            if not full_apptainer_cmd[current_cmd_start_index:]:
+                 full_apptainer_cmd.extend(args.command_and_args)
+
+        echo_info("  Running in foreground mode.")
+        process = run_command(full_apptainer_cmd, use_popen=True, cwd=args.workdir) 
+        
+        if process and hasattr(process, 'pid'):
+            pid_to_register = process.pid
+            echo_info(f"  Foreground process started with PID: {pid_to_register}")
+            add_managed_instance(str(pid_to_register), 
+                                 image_ref_for_apptainer_command, display_image_name_for_ps, 
+                                 command_str_for_ps, start_time_iso, current_user,
+                                 is_apptainer_instance=False, original_gpus_arg=original_gpus_arg_for_storage, name_arg=args.name)
+            try:
+                process.wait()
+                echo_info(f"  Foreground process PID {pid_to_register} exited with code {process.returncode}.")
+            except KeyboardInterrupt:
+                echo_info(f"  Foreground process PID {pid_to_register} interrupted.")
+                process.terminate(); process.wait() 
+            finally:
+                if args.rm: 
+                    echo_info(f"  --rm specified, removing instance PID {pid_to_register} from state after exit.")
+                    remove_managed_instance(str(pid_to_register))
+        else:
+            echo_error("Failed to start foreground process.")
+
+def handle_images(args):
+    ensure_docktainer_dirs()
+    header = f"{'REPOSITORY':<30} {'TAG':<20} {'IMAGE ID':<15} {'CREATED':<25} {'SIZE'}"
+    echo_output(header)
+    try:
+        sif_files = [f for f in os.listdir(DOCKTAINER_SIF_DIR) if f.endswith(".sif")]
+        if not sif_files: echo_info("No SIF images found in local store."); return
+        sif_files.sort(key=lambda x: os.path.getmtime(os.path.join(DOCKTAINER_SIF_DIR, x)), reverse=True)
+        for sif_file in sif_files:
+            full_path = os.path.join(DOCKTAINER_SIF_DIR, sif_file)
+            try:
+                size_bytes = os.path.getsize(full_path); size_mb = size_bytes / (1024*1024); size_str = f"{size_mb:.2f}MB"
+                mtime = os.path.getmtime(full_path); created_time = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                name_part = sif_file[:-4]; tag = "latest"; repo = name_part
+                if "_" in name_part: 
+                    parts = name_part.rsplit('_', 1)
+                    if len(parts) == 2 and parts[1]: repo = parts[0]; tag = parts[1]
+                    else: repo = name_part
+                image_id_hash = hashlib.sha256(sif_file.encode()).hexdigest(); image_id = image_id_hash[:12]
+                echo_output(f"{repo:<30} {tag:<20} {image_id:<15} {created_time:<25} {size_str}")
+            except Exception as e: echo_error(f"Could not process file {sif_file}: {e}")
+    except FileNotFoundError: echo_info(f"SIF directory {DOCKTAINER_SIF_DIR} not found.")
+    except Exception as e: echo_error(f"Error listing images: {e}")
+
+def handle_rmi(args):
+    ensure_docktainer_dirs()
+    echo_info(f"Attempting to remove image: {args.image_or_sif}")
+    sif_path_to_remove = get_sif_path(args.image_or_sif)
+    removed_successfully = False
+    if not sif_path_to_remove: 
+        potential_sif_name = args.image_or_sif
+        if not potential_sif_name.endswith(".sif"): 
+            potential_sif_name = args.image_or_sif.replace(":", "_").replace("/", "_") + ".sif"
+        sif_path_to_remove = os.path.join(DOCKTAINER_SIF_DIR, potential_sif_name)
+    if sif_path_to_remove and os.path.exists(sif_path_to_remove):
+        try:
+            os.remove(sif_path_to_remove); echo_output(f"Untagged: {args.image_or_sif} (locally)"); echo_output(f"Deleted: {sif_path_to_remove}"); removed_successfully = True
+        except OSError as e: echo_error(f"Error removing {sif_path_to_remove}: {e}")
+    else: echo_error(f"Error: No such image: {args.image_or_sif} (checked path: {sif_path_to_remove})")
+    if not removed_successfully: echo_error(f"Failed to remove image '{args.image_or_sif}'.")
+
+def handle_ps(args):
+    ensure_docktainer_dirs()
+    echo_info("Listing managed Docktainer processes/instances:")
+    header = f"{'ID/NAME':<40} {'IMAGE':<30} {'COMMAND (at start)':<30} {'CREATED':<25} {'STATUS':<10} {'USER':<15} {'PID'}"
+    echo_output(header)
+
+    instances = load_instances()
+    active_entry_found = False
+    stale_identifiers = []
+
+    if not instances:
+        echo_info("No instances found in state file. (Run 'docktainer run -d ...' or interactive 'docktainer run ...' to register).")
+        return
+
+    for identifier_str, data in list(instances.items()): 
+        is_apptainer_inst = data.get("is_apptainer_instance", False)
+        is_running = False
+        pid_to_display = "N/A"
+
+        if is_apptainer_inst: 
+            is_running, pid = is_apptainer_instance_running_on_system(identifier_str)
+            if pid: pid_to_display = str(pid)
+        else: 
+            try:
+                pid = int(identifier_str)
+                is_running = is_pid_running_on_system(pid)
+                if is_running: pid_to_display = identifier_str
+            except ValueError: 
+                echo_info(f"Invalid PID format in state file: {identifier_str}")
+                stale_identifiers.append(identifier_str)
+                continue
+        
+        if is_running:
+            active_entry_found = True
+            image_display = data.get("image_display", "unknown")
+            command_at_start = data.get("command_at_start", "")
+            created_iso = data.get("created_iso", "")
+            user = data.get("user", "unknown")
+            name_arg = data.get("name_arg", "") 
+            
+            display_id = name_arg if name_arg and is_apptainer_inst else identifier_str
+
+            if len(image_display) > 28: image_display = image_display[:25] + "..."
+            if len(command_at_start) > 28: command_at_start = command_at_start[:25] + "..."
+            if len(display_id) > 38: display_id = display_id[:35] + "..."
+            
+            created_str = "unknown time"
+            if created_iso:
+                try:
+                    dt_object = datetime.datetime.fromisoformat(created_iso)
+                    now = datetime.datetime.now(); delta = now - dt_object
+                    if delta.total_seconds() < 0: created_str = "Just now (future?)"
+                    elif delta.days == 0:
+                        if delta.seconds < 2: created_str = "Just now"
+                        elif delta.seconds < 60: created_str = f"{delta.seconds}s ago"
+                        elif delta.seconds < 3600: created_str = f"{delta.seconds // 60}m ago"
+                        else: created_str = f"{delta.seconds // 3600}h ago"
+                    elif delta.days == 1: created_str = "Yesterday"
+                    else: created_str = f"{delta.days}d ago"
+                    if len(created_str) > 23: created_str = dt_object.strftime('%Y-%m-%d %H:%M')
+                except ValueError: pass 
+            
+            status_str = "Up"
+            echo_output(f"{display_id:<40} {image_display:<30} {command_at_start:<30} {created_str:<25} {status_str:<10} {user:<15} {pid_to_display}")
+        else:
+            stale_identifiers.append(identifier_str)
+            echo_info(f"Instance/Process '{identifier_str}' (Image: {data.get('image_display')}) is no longer running. Marking for removal from state.")
+    
+    if stale_identifiers:
+        echo_info(f"Cleaning up {len(stale_identifiers)} stale entry(s) from state file...")
+        current_instances_for_save = load_instances() 
+        for id_stale in stale_identifiers:
+            if id_stale in current_instances_for_save: del current_instances_for_save[id_stale]
+        if not save_instances(current_instances_for_save):
+             echo_error("Failed to save updated instances file after cleanup.")
+    
+    if not active_entry_found:
+        final_instances_check = load_instances()
+        if not final_instances_check : 
+            echo_info("No managed Docktainer instances or processes found.")
+        elif instances and not stale_identifiers: # No active, but instances existed and none were stale (should not happen if logic is correct)
+             echo_info("No active managed Docktainer instances or processes found.")
+
+
+def handle_exec(args):
+    ensure_docktainer_dirs()
+    instance_name_to_exec = args.instance_name 
+    command_to_run = args.command_and_args
+    
+    echo_info(f"Attempting to exec into instance: {instance_name_to_exec}")
+    if not command_to_run: echo_error("No command provided to execute."); return
+
+    instance_details, found_name = get_managed_instance_details(instance_name_to_exec)
+    if not instance_details or not found_name or not instance_details.get("is_apptainer_instance"):
+        echo_error(f"Docktainer entry '{instance_name_to_exec}' not found or is not an Apptainer instance. 'exec' is for instances started with 'run -d'.")
+        return
+
+    is_running, _ = is_apptainer_instance_running_on_system(found_name)
+    if not is_running:
+        echo_error(f"Apptainer instance '{found_name}' is not currently running."); remove_managed_instance(found_name); return
+
+    apptainer_exec_cmd = ["apptainer", "exec"]
+    gpus_requested_for_instance = instance_details.get("gpus_requested")
+    if gpus_requested_for_instance:
+        apptainer_exec_cmd.append("--nv")
+        if gpus_requested_for_instance.lower() != "all":
+            apptainer_exec_cmd.extend(["--env", f"NVIDIA_VISIBLE_DEVICES={gpus_requested_for_instance}"])
+            echo_info(f"  Applying GPU settings for exec: NVIDIA_VISIBLE_DEVICES={gpus_requested_for_instance}")
+        else: echo_info("  Applying GPU settings for exec: --nv for all GPUs")
+    if args.it: echo_info("  Interactive TTY (-it) requested for exec.")
+    
+    apptainer_exec_cmd.append(f"instance://{found_name}")
+    apptainer_exec_cmd.extend(command_to_run)
+    
+    process = run_command(apptainer_exec_cmd, use_popen=True) 
+    if process:
+        try:
+            process.wait()
+        except KeyboardInterrupt:
+            echo_info(f"Exec process PID {process.pid} interrupted.")
+            process.terminate()
+            process.wait()
+
+
+def handle_stop(args):
+    ensure_docktainer_dirs()
+    instance_name_to_stop = args.instance_name
+    echo_info(f"Attempting to stop instance: {instance_name_to_stop}")
+
+    instance_details, found_name = get_managed_instance_details(instance_name_to_stop)
+    is_managed_apptainer_instance = instance_details and instance_details.get("is_apptainer_instance")
+
+    if not found_name: 
+        is_running_orphan, _ = is_apptainer_instance_running_on_system(instance_name_to_stop)
+        if is_running_orphan:
+            echo_info(f"Found Apptainer instance '{instance_name_to_stop}' running (orphaned from Docktainer state). Attempting to stop."); found_name = instance_name_to_stop
+        else: echo_error(f"Apptainer instance '{instance_name_to_stop}' not found running on system and not in Docktainer state."); return
+    elif not is_managed_apptainer_instance:
+        echo_error(f"Docktainer entry '{instance_name_to_stop}' is a foreground process PID, not a stoppable Apptainer instance. Use system 'kill {instance_name_to_stop}'.")
+        return
+    
+    apptainer_stop_cmd = ["apptainer", "instance", "stop", found_name]
+    if args.force: apptainer_stop_cmd.append("--force")
+    
+    result = run_command(apptainer_stop_cmd, check=False)
+    if result and (result.returncode == 0 or (hasattr(result, 'stderr') and result.stderr and "no instance found" in result.stderr.lower())):
+        echo_output(found_name); remove_managed_instance(found_name) 
+    elif result: echo_error(f"Failed to stop instance '{found_name}'. RC: {result.returncode}"); print_stderr_if_present(result)
+    else: echo_error(f"Command execution failed for stopping instance '{found_name}'.")
+
+def print_stderr_if_present(result_obj):
+    if hasattr(result_obj, 'stderr') and result_obj.stderr:
+        echo_error(f"Stderr: {result_obj.stderr.strip()}")
+
+
+# --- Dockerfile to Apptainer Definition File Conversion (Simplified) ---
+def parse_dockerfile_to_def(dockerfile_path, def_file_path, build_context_path):
+    echo_info(f"Parsing Dockerfile: {dockerfile_path}")
+    echo_info(f"Generating Apptainer definition file: {def_file_path}")
+    if not os.path.exists(dockerfile_path):
+        echo_error(f"Dockerfile not found at {dockerfile_path}"); return False
+    def_content = {"header": [], "files": [], "post": [], "environment": [], "runscript": [], "labels": []}
+    try:
+        with open(dockerfile_path, 'r') as df: lines = df.readlines()
+        for line_num, line_content in enumerate(lines):
+            line = line_content.strip()
+            if not line or line.startswith('#'): continue
+            parts = line.split(None, 1); instruction = parts[0].upper(); value = parts[1] if len(parts) > 1 else ""
+            if instruction == "FROM": def_content["header"].extend([f"Bootstrap: docker", f"From: {value}"])
+            elif instruction == "RUN": def_content["post"].append(value)
+            elif instruction == "ENV":
+                env_parts = value.split("=", 1)
+                if len(env_parts) == 2: def_content["environment"].append(f"export {env_parts[0].strip()}=\"{env_parts[1].strip()}\"")
+                else: 
+                    env_key_val = value.split(None, 1)
+                    if len(env_key_val) == 2: def_content["environment"].append(f"export {env_key_val[0].strip()}=\"{env_key_val[1].strip()}\"")
+                    else: echo_info(f"  Skipping malformed ENV (line {line_num+1}): {line_content.strip()}")
+            elif instruction == "COPY":
+                copy_parts = value.split()
+                if len(copy_parts) >= 2:
+                    dest_in_container = copy_parts[-1]
+                    for src_on_host_relative in copy_parts[:-1]: def_content["files"].append(f"{src_on_host_relative} {dest_in_container}")
+                else: echo_info(f"  Skipping malformed COPY (line {line_num+1}): {line_content.strip()}")
+            elif instruction == "WORKDIR": def_content["post"].extend([f"mkdir -p {value}", f"cd {value}"])
+            elif instruction == "LABEL":
+                label_parts = value.split("=",1)
+                if len(label_parts) == 2: def_content["labels"].append(f"{label_parts[0].strip()} \"{label_parts[1].strip()}\"")
+                else: 
+                    label_key_val = value.split(None,1)
+                    if len(label_key_val) == 2: def_content["labels"].append(f"{label_key_val[0].strip()} \"{label_key_val[1].strip()}\"")
+                    else: echo_info(f"  Skipping malformed LABEL (line {line_num+1}): {line_content.strip()}")
+            elif instruction == "CMD":
+                cmd_value = value
+                if value.startswith("[") and value.endswith("]"): 
+                    try: cmd_list = json.loads(value); cmd_value = " ".join([f'"{p}"' if " " in p else p for p in cmd_list]) 
+                    except Exception as e: echo_info(f"  Error parsing CMD JSON (line {line_num+1}): {value}. Error: {e}. Using raw.")
+                def_content["runscript"] = [f"exec {cmd_value}"] 
+            elif instruction == "ENTRYPOINT":
+                ep_value = value
+                if value.startswith("[") and value.endswith("]"): 
+                    try: ep_list = json.loads(value); ep_value = " ".join([f'"{p}"' if " " in p else p for p in ep_list])
+                    except Exception as e: echo_info(f"  Error parsing ENTRYPOINT JSON (line {line_num+1}): {value}. Error: {e}. Using raw.")
+                if def_content["runscript"] and def_content["runscript"][-1].startswith("exec "):
+                    cmd_args = def_content["runscript"][-1][5:]; def_content["runscript"] = [f"exec {ep_value} {cmd_args}"]
+                else: def_content["runscript"] = [f"exec {ep_value} \"$@\""]
+            else: echo_info(f"  Unsupported Dockerfile instruction (line {line_num+1}): {instruction}")
+        
+        final_def_content = []
+        if not def_content["header"]: echo_error("Dockerfile parsing error: Missing FROM."); return False
+        final_def_content.extend(def_content["header"])
+        if def_content["environment"]: final_def_content.extend(["\n%environment"] + def_content["environment"])
+        if def_content["files"]: final_def_content.extend(["\n%files"] + def_content["files"])
+        if def_content["labels"]: final_def_content.extend(["\n%labels"] + def_content["labels"])
+        if def_content["post"]:
+            final_def_content.append("\n%post")
+            final_def_content.extend(["    set -e", "    export DEBIAN_FRONTEND=noninteractive"] + [f"    {cmd}" for cmd in def_content["post"]])
+        final_def_content.append("\n%runscript")
+        if def_content["runscript"]: final_def_content.extend(def_content["runscript"])
+        else: final_def_content.extend(['    echo "Docktainer: No CMD/ENTRYPOINT."','    exec /bin/bash "$@"'])
+        with open(def_file_path, 'w') as f: f.write("\n".join(final_def_content).replace("\n\n","\n").strip() + "\n") 
+        echo_info(f"Successfully generated definition file: {def_file_path}"); return True
+    except Exception as e: echo_error(f"Failed to parse Dockerfile or write definition file: {e}"); return False
+
+def handle_build(args):
+    ensure_docktainer_dirs()
+    build_context_path = os.path.abspath(args.path)
+    echo_info(f"Building image from context: {build_context_path}")
+    dockerfile_path = os.path.join(build_context_path, 'Dockerfile')
+    if not os.path.exists(dockerfile_path):
+        dockerfile_path_alt = os.path.join(build_context_path, 'dockerfile') 
+        if os.path.exists(dockerfile_path_alt): dockerfile_path = dockerfile_path_alt
+        else: echo_error(f"Dockerfile not found in context: {args.path}"); return
+
+    sif_name_base = "docktainer_custom_image"
+    if args.tag: sif_name_base = args.tag.replace(":", "_").replace("/", "_")
+    sif_file_path = os.path.join(DOCKTAINER_SIF_DIR, f"{sif_name_base}.sif")
+    temp_def_file_name = f".{sif_name_base}.def.tmp" 
+    temp_def_file_path_in_context = os.path.join(build_context_path, temp_def_file_name)
+
+    if parse_dockerfile_to_def(dockerfile_path, temp_def_file_path_in_context, build_context_path):
+        apptainer_cmd = ["apptainer", "build", "--force", sif_file_path, temp_def_file_path_in_context]
+        result = run_command(apptainer_cmd, cwd=build_context_path)
+        if result and result.returncode == 0:
+            echo_output(f"Successfully built SIF image: {sif_file_path}")
+            echo_info(f"Tagged as: {args.tag if args.tag else sif_name_base}")
+        else: echo_error(f"Apptainer build failed for {sif_file_path} using {temp_def_file_path_in_context}")
+    else: echo_error("Failed to generate definition file from Dockerfile. Build aborted.")
+    if os.path.exists(temp_def_file_path_in_context):
+        try: os.remove(temp_def_file_path_in_context)
+        except OSError as e: echo_error(f"Could not remove temp def file {temp_def_file_path_in_context}: {e}")
+
+def main():
+    global VERBOSE_MODE 
+    parser = argparse.ArgumentParser(
+        description="Docktainer - A Docker-like wrapper for Apptainer.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""Examples:
+  docktainer pull ubuntu:latest
+  docktainer run -it --rm -v /data:/mnt ubuntu_latest.sif /bin/bash
+  docktainer run -d --name my_server --gpus all nvidia/cuda:12.2.0-base-ubuntu22.04
+  docktainer exec -it my_server nvidia-smi
+  docktainer ps
+  docktainer stop my_server
+  docktainer build -t myapp:v1 ./app_context
+"""
+    )
+    parser.add_argument("-V", "--verbose", action="store_true", help="Enable verbose output.")
+    subparsers = parser.add_subparsers(dest="docker_command", title="Supported Docker Commands", help="Sub-command help", required=True) 
+
+    pull_parser = subparsers.add_parser("pull", help="Pull an image from Docker Hub and store as SIF.")
+    pull_parser.add_argument("--force", action="store_true", help="Force pull, overwriting local SIF if it exists.")
+    pull_parser.add_argument("image_name", help="Name of the image to pull (e.g., ubuntu:latest)")
+    pull_parser.set_defaults(func=handle_pull)
+
+    run_parser = subparsers.add_parser("run", help="Run a command or start an instance.")
+    run_parser.add_argument("-i", "--interactive", action="store_true", help="Run interactively.")
+    run_parser.add_argument("-t", "--tty", action="store_true", help="Allocate a pseudo-TTY.")
+    run_parser.add_argument("--it", action="store_true", help="Combined -i and -t (processed automatically).")
+    run_parser.add_argument("-d", "--detach", action="store_true", help="Run as a detached Apptainer instance.")
+    run_parser.add_argument("-v", "--volume", action="append", help="Bind mount a volume (host_path:container_path).")
+    run_parser.add_argument("-e", "--env", action="append", help="Set environment variable (VAR=value).")
+    run_parser.add_argument("-w", "--workdir", help="Working directory inside the container (Apptainer --cwd).")
+    run_parser.add_argument("--rm", action="store_true", help="Remove instance state on exit (for interactive/foreground).")
+    run_parser.add_argument("--gpus", help="Enable GPU access. Use 'all' or comma-separated IDs (e.g., '0,1').")
+    run_parser.add_argument("--name", help="Assign a name to the instance (especially for -d).") 
+    run_parser.add_argument("image_name", help="Name of the image (e.g., ubuntu:latest or my_image.sif) or Docker URI.")
+    run_parser.add_argument("command_and_args", nargs=argparse.REMAINDER, help="Command for 'exec' or 'shell' mode. Ignored for 'instance start' (-d).")
+    run_parser.set_defaults(func=handle_run)
+
+    images_parser = subparsers.add_parser("images", help="List locally stored SIF images.")
+    images_parser.set_defaults(func=handle_images)
+
+    rmi_parser = subparsers.add_parser("rmi", help="Remove a local SIF image.")
+    rmi_parser.add_argument("image_or_sif", help="Name or SIF filename of the image to remove.")
+    rmi_parser.set_defaults(func=handle_rmi)
+
+    ps_parser = subparsers.add_parser("ps", help="List running Apptainer instances managed by Docktainer.")
+    ps_parser.add_argument("-a", "--all", action="store_true", help="(Conceptual) Shows all managed by state file; stale ones are cleaned.")
+    ps_parser.set_defaults(func=handle_ps)
+
+    exec_parser = subparsers.add_parser("exec", help="Run a command in a running Apptainer instance.")
+    exec_parser.add_argument("-i", "--interactive", action="store_true", help="Run interactively.") 
+    exec_parser.add_argument("-t", "--tty", action="store_true", help="Allocate a pseudo-TTY.") 
+    exec_parser.add_argument("--it", action="store_true", help="Combined -i and -t.")
+    exec_parser.add_argument("instance_name", help="Name of the running instance (from 'docktainer run -d --name ...').")
+    exec_parser.add_argument("command_and_args", nargs=argparse.REMAINDER, help="Command and arguments to execute in the instance.")
+    exec_parser.set_defaults(func=handle_exec)
+
+    stop_parser = subparsers.add_parser("stop", help="Stop one or more running Apptainer instances.")
+    stop_parser.add_argument("--force", action="store_true", help="Force stop the instance (Apptainer --force).")
+    stop_parser.add_argument("instance_name", help="Name of the instance to stop.") 
+    stop_parser.set_defaults(func=handle_stop)
+
+    build_parser = subparsers.add_parser("build", help="Build an Apptainer SIF image from a (simplified) Dockerfile.")
+    build_parser.add_argument("-t", "--tag", help="Name and optionally a tag for the SIF image (e.g., 'myapp:v1').")
+    build_parser.add_argument("path", help="Path to the build context (directory containing the Dockerfile or dockerfile).")
+    build_parser.set_defaults(func=handle_build)
+    
+    global_parser = argparse.ArgumentParser(add_help=False) 
+    global_parser.add_argument("-V", "--verbose", action="store_true")
+    global_args, remaining_argv = global_parser.parse_known_args() 
+
+    if global_args.verbose:
+        VERBOSE_MODE = True 
+        echo_info("Verbose mode enabled.")
+    
+    args = parser.parse_args(remaining_argv if remaining_argv else None) # Pass remaining to main parser
+
+    # This check is now more robust because subparsers are required=True by default in Python 3.7+ for add_subparsers
+    # If no command is given, argparse will exit with an error.
+    # We only need to handle the special /tmp/sandbox_in case if it bypasses normal parsing.
+    if not hasattr(args, 'docker_command') or args.docker_command is None:
+        # This path might be taken if only global options like -V were passed and no command,
+        # and if subparsers were not set to required (though they are by default now).
+        # Or if the sandbox argument is the first positional one.
+        if len(sys.argv) > 1 and sys.argv[0].endswith(("docktainer", "docktainer.py")) and \
+           sys.argv[1] == '/tmp/sandbox_in' and (not hasattr(args, 'docker_command') or args.docker_command is None):
+             echo_info(f"Execution environment note: '{sys.argv[1]}' was passed as an argument."); parser.print_help(sys.stderr); sys.exit(0)
+        # If it's not the sandbox issue and still no command, argparse should have handled it.
+        # If we get here, it's an unexpected state or only -V was passed.
+        if args.verbose and not args.docker_command: # Only -V was passed
+            parser.print_help(sys.stderr)
+            sys.exit(0)
+        # If still no command, and not just -V, it's an error (though argparse usually catches this)
+        if not args.docker_command:
+            echo_error(f"A command is required. Please choose from {list(subparsers.choices.keys())}")
+            parser.print_help(sys.stderr)
+            sys.exit(1)
+
+    if args.docker_command == 'run' or args.docker_command == 'exec':
+        args.it = (args.interactive and args.tty) or args.it 
+    if args.docker_command == 'run' and args.name: 
+        echo_info(f"  Container name specified: {args.name} (will be used as Apptainer instance name if -d).")
+
+    if hasattr(args, 'func'): args.func(args)
+    else: echo_error(f"No function associated with command: {args.docker_command}"); parser.print_help(sys.stderr); sys.exit(1)
+
+if __name__ == "__main__":
+    ensure_docktainer_dirs()
+    main()
