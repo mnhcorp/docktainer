@@ -25,13 +25,13 @@ This tool translates common Docker commands into their Apptainer equivalents, ma
 
 2. **Make it Executable:**
     ```bash
-    chmod +x docktainer.py
+    chmod +x docktainer
     ```
 
 3. **Place it in your PATH (Recommended):**  
     To run `docktainer` from any directory, move it to a location in your system's `PATH` (e.g., `/usr/local/bin`) and optionally rename it.
     ```bash
-    sudo mv docktainer.py /usr/local/bin/docktainer
+    sudo mv docktainer /usr/local/bin/docktainer
     ```
     Alternatively, create a symbolic link or add its directory to your `PATH` environment variable. After this, you can invoke it simply as `docktainer`.
 
