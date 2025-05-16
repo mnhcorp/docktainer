@@ -21,7 +21,7 @@ This tool translates common Docker commands into their Apptainer equivalents, ma
 ## Installation
 
 1. **Download/Save the Script:**  
-    Obtain the `docktainer.py` script and save it to your system.
+    Obtain the `docktainer` script and save it to your system.
 
 2. **Make it Executable:**
     ```bash
